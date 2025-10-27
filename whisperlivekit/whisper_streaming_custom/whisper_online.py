@@ -5,7 +5,7 @@ import librosa
 from functools import lru_cache
 import time
 import logging
-from .backends import FasterWhisperASR, MLXWhisper, WhisperTimestampedASR, OpenaiApiASR
+from .backends import FasterWhisperASR, MLXWhisper, WhisperTimestampedASR, OpenaiApiASR, TritonWhisperASR
 from whisperlivekit.warmup import warmup_asr
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,8 @@ def backend_factory(
             asr_cls = FasterWhisperASR
         elif backend == "mlx-whisper":
             asr_cls = MLXWhisper
+        elif backend == "triton-whisper":
+            asr_cls = TritonWhisperASR
         else:
             asr_cls = WhisperTimestampedASR
 

@@ -5,6 +5,7 @@ import soundfile as sf
 import math
 from typing import List
 import numpy as np
+import os
 from whisperlivekit.timed_objects import ASRToken
 logger = logging.getLogger(__name__)
 class ASRBase:
@@ -221,6 +222,142 @@ class MLXWhisper(ASRBase):
     def set_translate_task(self):
         self.transcribe_kargs["task"] = "translate"
 
+
+class TritonWhisperASR(ASRBase):
+    """
+    Uses a remote Triton Inference Server hosting Faster-Whisper.
+    Expects:
+      - input name: "AUDIO_DATA" (FP32, dims: [-1])
+      - output name: "RESULT" (TYPE_STRING, dims: [1]) containing JSON with fields:
+          {
+            "segments": [
+              {"start": float, "end": float, "no_speech_prob": float,
+               "words": [{"start": float, "end": float, "word": str, "probability": float}]}
+            ],
+            "info": { ... optional ... }
+          }
+    """
+    sep = ""
+
+    def __init__(self, lan, model_size=None, cache_dir=None, model_dir=None, logfile=sys.stderr, triton_url: str = "triton:9101", use_grpc: bool = True):
+        self.logfile = logfile
+        self.transcribe_kargs = {}
+        self.sep = ""
+        if lan == "auto":
+            self.original_language = None
+        else:
+            self.original_language = lan
+        env_url = os.getenv("TRITON_URL")
+        self.triton_url = env_url if env_url else triton_url
+        env_use_grpc = os.getenv("TRITON_USE_GRPC")
+        if env_use_grpc is not None:
+            self.use_grpc = env_use_grpc not in ["0", "false", "False"]
+        else:
+            self.use_grpc = use_grpc
+        self.model = self.load_model(model_size, cache_dir, model_dir)
+
+    def load_model(self, model_size=None, cache_dir=None, model_dir=None):
+        # For Triton-backed backend, "model" holds the Triton client instance
+        try:
+            if self.use_grpc:
+                import tritonclient.grpc as grpcclient
+                self._client = grpcclient.InferenceServerClient(url=self.triton_url, verbose=False)
+                self._infer_input_cls = grpcclient.InferInput
+                self._infer_output_cls = grpcclient.InferRequestedOutput
+            else:
+                import tritonclient.http as httpclient
+                self._client = httpclient.InferenceServerClient(url=f"http://{self.triton_url}", verbose=False)
+                self._infer_input_cls = httpclient.InferInput
+                self._infer_output_cls = httpclient.InferRequestedOutput
+        except Exception as e:
+            logger.error(f"Failed to initialize Triton client: {e}")
+            raise
+        # Return any non-None to indicate initialization ok
+        return object()
+
+    def _build_inputs(self, audio: np.ndarray, init_prompt: str = ""):
+        # === AUDIO_DATA: FP32, shape [B, T] ===
+        # Triton에서 max_batch_size > 0 이므로 첫 차원은 배치입니다.
+        audio = audio.astype(np.float32, copy=False)
+        inp_audio = self._infer_input_cls("AUDIO_DATA", [1, audio.shape[0]], "FP32")
+        inp_audio.set_data_from_numpy(audio[np.newaxis, :])  # (1, N)
+
+        # === OPTIONS: BYTES/STRING, shape [B, 1] ===
+        options = {}
+        lang = self.original_language if self.original_language is not None else "auto"
+        options["language"] = lang
+        if init_prompt:
+            options["initial_prompt"] = init_prompt
+        task = self.transcribe_kargs.get("task")
+        if task:
+            options["task"] = task
+        if "beam_size" in self.transcribe_kargs:
+            options["beam_size"] = int(self.transcribe_kargs["beam_size"])
+        if "best_of" in self.transcribe_kargs:
+            options["best_of"] = int(self.transcribe_kargs["best_of"])
+
+        import json as _json
+        # dtype=object 로 2D (배치차원 포함)로 만들어야 함 → (1, 1)
+        opts_np = np.array([[_json.dumps(options)]], dtype=object)
+        inp_opts = self._infer_input_cls("OPTIONS", [1, 1], "BYTES")
+        inp_opts.set_data_from_numpy(opts_np)
+
+        # === 요청/응답 ===
+        inputs = [inp_audio, inp_opts]
+        # RESULT는 model config에서 dims:[1] 이므로, 실제 출력은 [B, 1] → [1, 1]
+        outputs = [self._infer_output_cls("RESULT")]
+        return inputs, outputs
+
+    def transcribe(self, audio: np.ndarray, init_prompt: str = "") -> dict:
+        inputs, outputs = self._build_inputs(audio, init_prompt)
+        try:
+            result = self._client.infer(model_name="faster_whisper", inputs=inputs, outputs=outputs)
+            if self.use_grpc:
+                out = result.as_numpy("RESULT")
+            else:
+                out = result.as_numpy("RESULT")
+            # Expect out shape [1], dtype object/bytes -> decode JSON string
+            if out is None or out.size == 0:
+                return {"segments": [], "info": {}}
+            payload = out[0]
+            if isinstance(payload, (bytes, bytearray)):
+                payload = payload.decode("utf-8", errors="ignore")
+            import json
+            return json.loads(payload)
+        except Exception as e:
+            logger.error(f"Triton inference failed: {e}")
+            return {"segments": [], "info": {}}
+
+    def ts_words(self, res) -> List[ASRToken]:
+        tokens = []
+        if not res:
+            return tokens
+        segments = res.get("segments", []) if isinstance(res, dict) else res
+        for seg in segments:
+            if seg.get("no_speech_prob", 0) > 0.9:
+                continue
+            for w in seg.get("words", []):
+                tokens.append(ASRToken(
+                    w.get("start", 0.0),
+                    w.get("end", 0.0),
+                    w.get("word", ""),
+                    probability=w.get("probability")
+                ))
+        return tokens
+
+    def segments_end_ts(self, res) -> List[float]:
+        if not res:
+            return []
+        segments = res.get("segments", []) if isinstance(res, dict) else res
+        return [seg.get("end", 0.0) for seg in segments]
+
+    def use_vad(self):
+        # Optionally propagate a flag via additional inputs if server supports VAD
+        self.transcribe_kargs["vad_filter"] = True
+
+    def set_translate_task(self):
+        # Optionally propagate a flag via additional inputs if server supports translate
+        self.transcribe_kargs["task"] = "translate"
 
 class OpenaiApiASR(ASRBase):
     """Uses OpenAI's Whisper API for transcription."""

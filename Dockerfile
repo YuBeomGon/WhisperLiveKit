@@ -36,14 +36,16 @@ RUN pip3 install --upgrade pip setuptools wheel && \
 
 COPY . .
 
-# Install WhisperLiveKit directly, allowing for optional dependencies
+# Install current source instead of PyPI package
 RUN if [ -n "$EXTRAS" ]; then \
-      echo "Installing with extras: [$EXTRAS]"; \
-      pip install --no-cache-dir whisperlivekit[$EXTRAS]; \
+      echo "Installing current source with extras: [$EXTRAS]"; \
+      pip install --no-cache-dir -e .[$EXTRAS]; \
     else \
-      echo "Installing base package only"; \
-      pip install --no-cache-dir whisperlivekit; \
+      echo "Installing current source (editable)"; \
+      pip install --no-cache-dir -e .; \
     fi
+
+RUN pip install --no-cache-dir tritonclient[all]
 
 # In-container caching for Hugging Face models by: 
 # A) Make the cache directory persistent via an anonymous volume.

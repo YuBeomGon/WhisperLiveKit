@@ -133,7 +133,7 @@ def parse_args():
         "--backend",
         type=str,
         default="simulstreaming",
-        choices=["faster-whisper", "whisper_timestamped", "mlx-whisper", "openai-api", "simulstreaming"],
+        choices=["faster-whisper", "whisper_timestamped", "mlx-whisper", "openai-api", "simulstreaming", "triton-whisper"],
         help="Load only this backend for Whisper processing.",
     )
     parser.add_argument(
